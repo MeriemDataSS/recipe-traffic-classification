@@ -1,0 +1,1982 @@
+---
+title: "Predicting High-Traffic Recipes: A Binary Classification Study"
+
+output:
+  html_document:
+        number_sections: FALSE
+        toc: TRUE
+        toc_depth: 3
+        toc_float:
+          collapsed: FALSE
+          smooth_scroll: TRUE
+        code_folding: 'show'
+        code_download: TRUE
+        df_print: paged
+        highlight: tango
+        fig_width: 8
+        fig_height: 5
+        theme:
+          bootswatch: flatly
+---
+<div style="text-align:center;color:blue">
+
+</div>
+
+<div style="text-align:center;color:black">
+
+**Classification, Regression, and Prediction Project**  
+
+</div>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+
+# Packages used with the "::" syntax only (no library() call, to avoid masking dplyr functions):
+#   car, sandwich, lmtest, scales
+# If one of them is missing:  install.packages(c("car", "sandwich", "lmtest"))
+```
+
+**Objective.** The goal of this project is to predict whether a recipe displayed on the website generates *High* or *Low* traffic, from its category, number of servings and nutritional content. We compare four models (linear probability model, logit, penalised logit with LASSO, and random forest), choose one, and use it to identify what drives traffic.
+
+
+# 1. Data wrangling.
+
+## 1.1 Data loading
+
+```{r}
+# ==============================================================================
+# 1. ENVIRONMENT AND PACKAGES
+# ==============================================================================
+
+# Load the packages required for the analysis.
+
+library(tidyverse)
+library(caret)
+library(yardstick)
+library(glmnet)
+library(mfx)
+library(stargazer)
+library(gridExtra)
+library(rsample)
+library(ranger)
+library(purrr)
+library(corrplot)
+library(knitr)
+
+
+# ==============================================================================
+# 2. GLOBAL SETTINGS
+# ==============================================================================
+
+# Set a consistent theme for all ggplot2 figures.
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(color = "grey40"),
+      legend.position = "top",
+      panel.grid.minor = element_blank()
+    )
+)
+
+# Consistent colours for traffic classes across all figures.
+traffic_colors <- c(
+  "High" = "#1B7F79",
+  "Low"  = "#E07A5F"
+)
+
+# Format a vector of names as readable text.
+# Return "none" when the vector is empty.
+format_list <- function(x) {
+  if (length(x) == 0L) {
+    return("none")
+  }
+
+  paste(x, collapse = ", ")
+}
+
+# ==============================================================================
+# 3. DATA IMPORT
+# ==============================================================================
+# Expected location: project root directory.
+data_file <- "recipe_site_traffic_2212.csv"
+
+# Check that the input file exists before importing the data.
+if (!file.exists(data_file)) {
+  stop(
+    "Input file not found: ", data_file,
+    "\nPlease check that the CSV file is in the project directory."
+  )
+}
+
+# Import the dataset.
+data <- readr::read_csv(
+  data_file,
+  show_col_types = FALSE
+)
+
+# Confirm that the dataset has been imported successfully.
+if (nrow(data) == 0L || ncol(data) == 0L) {
+  stop("The imported dataset is empty.")
+}
+
+# Display the dimensions and structure of the dataset.
+cat("\n--- Dataset dimensions ---\n")
+cat("Number of observations:", nrow(data), "\n")
+cat("Number of variables:", ncol(data), "\n")
+
+cat("\n--- Dataset structure ---\n")
+glimpse(data)
+
+# ==============================================================================
+# 4. INITIAL DATA QUALITY CHECKS
+# ==============================================================================
+
+# Verify that the recipe identifier is present.
+if (!"recipe" %in% names(data)) {
+  stop("The expected identifier column 'recipe' is missing.")
+}
+
+# Check whether recipe identifiers are unique.
+recipe_id_is_unique <- !anyDuplicated(data$recipe)
+
+cat("\n--- Recipe identifier check ---\n")
+cat("Are recipe identifiers unique ?:", recipe_id_is_unique, "\n")
+
+# Count duplicated observations, excluding the recipe identifier.
+# This identifies repeated records with identical values in the other columns.
+duplicate_rows <- sum(
+  duplicated(dplyr::select(data, -recipe))
+)
+
+cat(
+  "Number of duplicated records (excluding recipe ID):",
+  duplicate_rows, "\n"
+)
+
+
+
+
+```
+
+**Comments:**
+
+The raw data contains `r nrow(data)` recipes and `r ncol(data)` variables. The variable *recipe* is a unique identifier (one value per row): it carries no predictive information and is removed in the next step.
+
+
+```{r}
+
+# ==============================================================================
+# 5. VARIABLE RECODING
+# ==============================================================================
+
+# Remove the recipe identifier and rename the target variable.
+# The recipe identifier is not retained for the subsequent analysis.
+
+data <- data %>%
+  dplyr::select(-recipe) %>%
+  dplyr::rename(traffic = high_traffic)
+
+
+# ==============================================================================
+# 6. CATEGORICAL VARIABLES: LEVELS AND FREQUENCIES
+# ==============================================================================
+
+# Identify character variables and inspect their distinct values.
+categorical_levels <- lapply(
+  data %>% dplyr::select(where(is.character)),
+  unique
+)
+
+cat("\n--- Distinct levels of character variables ---\n")
+print(categorical_levels)
+
+
+# Display frequency distributions for selected categorical variables.
+cat("\n--- Distribution of servings ---\n")
+print(table(data$servings, useNA = "ifany"))
+
+cat("\n--- Distribution of recipe categories ---\n")
+print(table(data$category, useNA = "ifany"))
+
+cat("\n--- Distribution of website traffic ---\n")
+print(table(data$traffic, useNA = "ifany"))
+
+```
+
+**Comments:**
+
+*category* : has 11 unique values describing dish types or main ingredients. Some categories are similar (e.g., "Chicken" vs "Chicken Breast") and could be grouped for analysis. We keep the 11 original categories, since each one is well represented (between about 70 and 105 recipes each).
+
+*servings* : Originally stored as a categorical variable, this variable is converted to numeric, considering that it represents the maximum number of people that can be served by this recipe. Thus, the modalities "4 as a snack" and "6 as a snack" are assigned the values 4 and 6, respectively.This choice is also justified by the fact that the "4 as a snack" and "6 as a snack" categories are rare (3 recipes in total).
+
+*traffic* : This dependant variable has only two modalities: "High" and NA. According to the data description, a recipe is flagged "High" when the traffic on the site was high when the recipe was displayed, and left empty otherwise. If we consider the NAs as missing values and remove them, the dataset would end up with only a single class ("High"), which is not feasible for analysis or modeling. NA is therefore interpreted as "not high", i.e. "Low" (this is an assumption of the study, discussed in the limitations at the end).
+
+
+```{r}
+
+# ==============================================================================
+# 7. DATA CLEANING: STANDARDIZE SERVING CATEGORIES
+# ==============================================================================
+
+# Standardize serving values by removing the descriptive suffix
+# from the two snack-related categories.
+
+data <- data %>%
+  dplyr::mutate(
+    servings = dplyr::case_when(
+      servings == "4 as a snack" ~ "4",
+      servings == "6 as a snack" ~ "6",
+      TRUE ~ as.character(servings)
+    )
+  )
+
+# Verify the updated serving categories.
+cat("\n--- Serving category frequencies after recoding ---\n")
+print(table(data$servings, useNA = "ifany"))
+
+# Inspect the updated dataset structure.
+dplyr::glimpse(data)
+
+
+```
+## 1.4. Dealing with missing values
+
+```{r}
+
+# ==============================================================================
+# 8. MISSING VALUES: DIAGNOSTIC
+# ==============================================================================
+
+# Calculate the number and proportion of missing values for each variable.
+
+missing_summary <- data %>%
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::everything(),
+      ~ sum(is.na(.x))
+    )
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  dplyr::mutate(
+    missing_rate = round(n_missing / nrow(data), 3),
+    missing_percentage = round(100 * missing_rate, 1)
+  ) %>%
+  
+  dplyr::arrange(dplyr::desc(missing_rate))%>%
+  dplyr::select(-missing_rate)
+
+# Display the missing-value summary.
+cat("\n--- Missing values by variable ---\n")
+print(missing_summary)
+
+
+
+```
+**Comments:**
+
+we remove the missing values, we would lose at least 39% of the observations. Moreover, we would end up with only a single modality of the dependent variable, which would distort the outcome variable . To overcome this issue, we first consider that recipes with unspecified traffic are of the "Low" class, and then we proceed to remove the remaining missing values, as they are very few. 
+
+Before removing them, we check that the missing nutritional values are not concentrated in a particular category or traffic class (otherwise deleting them could bias the sample).
+
+```{r}
+
+# ==============================================================================
+#  Missing nutritional data: row-level analysis
+# ==============================================================================
+
+# 1. Identify observations with at least one missing nutritional value
+nutritional_vars <- c("calories", "carbohydrate", "sugar", "protein")
+
+missing_nutri <- data %>%
+  dplyr::filter(
+    dplyr::if_any(
+      dplyr::all_of(nutritional_vars),
+      is.na
+    )
+  )
+
+# 2. Quantify incomplete observations
+n_incomplete <- nrow(missing_nutri)
+pct_incomplete <- round(100 * n_incomplete / nrow(data), 2)
+
+cat("\n--- Incomplete observations ---\n")
+cat("Number of incomplete rows:", n_incomplete, "\n")
+cat("Percentage of incomplete rows:", pct_incomplete, "%\n")
+
+# 3. Assess whether nutritional values are missing simultaneously
+joint_missing_summary <- missing_nutri %>%
+  dplyr::summarise(
+    n_all_four_missing = sum(
+      dplyr::if_all(
+        dplyr::all_of(nutritional_vars),
+        is.na
+      )
+    ),
+    proportion_all_four_missing = mean(
+      dplyr::if_all(
+        dplyr::all_of(nutritional_vars),
+        is.na
+      )
+    )
+  ) %>%
+  dplyr::mutate(
+    percentage_all_four_missing = round(
+      100 * proportion_all_four_missing, 2
+    )
+  )
+
+cat("\n--- Joint missingness of nutritional variables ---\n")
+print(joint_missing_summary)
+
+# 4. Distribution of incomplete observations by product category
+missing_by_category <- missing_nutri %>%
+  dplyr::count(category, name = "n_incomplete", sort = TRUE)
+
+cat("\n--- Incomplete observations by category ---\n")
+print(missing_by_category)
+
+# 5. Distribution of incomplete observations by traffic class
+missing_by_traffic <- missing_nutri %>%
+  dplyr::count(traffic, name = "n_incomplete", sort = TRUE)
+
+cat("\n--- Incomplete observations by traffic class ---\n")
+print(missing_by_traffic)
+
+```
+
+The missing nutritional values affect the four variables at the same time and are spread over the categories, so removing these rows (about 5% of the sample) does not distort the data in any visible way.
+
+*Next step* : 
+
+- Creation of the "Low" category for the traffic variable
+- Removal of missing values
+- Convert the servings variable to numeric, and the category and traffic variables to factors
+
+
+```{r}
+data$traffic[is.na(data$traffic)]<-"Low"
+data<-drop_na(data)
+data<-data%>% mutate(servings=as.numeric(servings))%>% mutate_if(is.character,as.factor)
+
+stopifnot(!anyNA(data))   # safety check: no missing value left
+glimpse(data)
+
+```
+
+**Comments:**
+
+The new sample contains `r nrow(data)` observations and `r ncol(data)` variables.
+
+We compute the nutritional content per serving for each recipe to enable comparisons, by dividing the values of calories, protein, carbohydrates, and sugar by the number of servings.
+
+Additionally, two new variables were created: su_cal, representing the sugar-to-calories ratio, and pro_su, representing the protein-to-sugar ratio.
+
+
+
+```{r}
+
+# ==============================================================================
+# Feature Engineering: Nutritional Content per Serving
+# ==============================================================================
+
+# 1. Calculate nutritional content per serving ---------------------------------
+
+data <- data %>%
+  mutate(
+    sugar       = round(sugar / servings, 4),
+    protein     = round(protein / servings, 4),
+    carbohydrate = round(carbohydrate / servings, 4),
+    calories    = round(calories / servings, 4)
+  ) %>%
+   # 2. Create nutritional ratios -----------------------------------------------
+  mutate(
+    su_cal = round(sugar / calories, 4),
+    pro_su = round(protein / sugar, 4)
+  )
+
+ 
+# 3. Validate derived variables ------------------------------------------------
+
+ratio_vars <- c("su_cal", "pro_su")
+
+ratio_checks <- data %>%
+  summarise(
+    across(
+      all_of(ratio_vars),
+      ~ sum(!is.finite(.x), na.rm = TRUE)
+    )
+  )
+
+print(ratio_checks)
+
+
+# 4. Inspect the resulting dataset ---------------------------------------------
+
+glimpse(data)
+```
+No infinite or undefined value was created by the two ratios. Note, however, that the ratios (and the nutritional variables themselves) are strongly right-skewed: most recipes have small values, while a few recipes have extreme ones. This is kept in mind when reading the histograms below.
+
+```{r}
+
+# ==============================================================================
+# Exploratory Data Analysis: Summary of Numeric Variables
+# ==============================================================================
+
+data %>%
+  dplyr::select(
+    servings,
+    calories,
+    carbohydrate,
+    sugar,
+    protein,
+    su_cal,
+    pro_su
+  ) %>%
+  summary()
+```
+
+# 2.Exploratory Data Analysis (EDA)
+
+## 2.1. Distribution of the Target Variable
+
+
+```{r}
+
+data%>%
+  count(traffic)%>%
+  mutate(prop=n/sum(n))
+
+# Define colors for traffic categories
+col_traffic <- c(
+  "High"   = "#D55E00",
+  "Low"    = "#009E73"
+)
+
+ggplot(data=data,aes(x = fct_infreq(traffic), fill = traffic))+    
+  geom_bar() +
+  ylab("Count") +
+  xlab("traffic")+
+  theme_minimal() +
+  scale_fill_manual(values =col_traffic)
+
+# Share of the majority class = accuracy of a naive model that always predicts "High"
+baseline_acc <- max(prop.table(table(data$traffic)))
+cat("Share of the majority class ",round(baseline_acc, 3))
+
+```
+
+**Comment :** 
+
+The two classes of the variable appear to be relatively balanced, suggesting that the dataset is sufficiently balanced for analysis, without any resampling.
+
+This share is also a useful **benchmark**: a naive model that always predicts "High" would already reach an accuracy of 0.598 
+A useful model must therefore do clearly better than this value, and accuracy must be completed by other metrics (AUC, sensitivity, specificity).
+
+
+### Descriptive Statistics by Recipe Category
+
+```{r}
+
+# ==============================================================================
+# Descriptive Statistics: Nutritional Content by Category
+# ==============================================================================
+
+category_summary <- data %>%
+  group_by(category) %>%
+  summarise(
+    n = n(),
+    across(
+      c(calories, protein, carbohydrate, sugar),
+      ~ round(mean(.x, na.rm = TRUE), 2)
+    ),
+    .groups = "drop"
+  )
+
+print(category_summary)
+
+
+```
+
+**Comment:** 
+
+The calculation of the average nutritional content (sugar, calories, protein, and carbohydrates) for each category shows that “One Dish Meal” and “Meat” are the most calorie-dense categories. “Chicken Breast” and “Chicken” are the richest in protein, “Potatoes” and “Dessert” have the highest carbohydrate content, while “Dessert” and “Beverages” are the highest in sugar.
+
+We now look directly at the link between the category and the target: the share of High-traffic recipes in each category.
+
+```{r}
+
+# ==============================================================================
+# Exploratory Data Analysis: High-Traffic Share by Category
+# ==============================================================================
+
+# 1. Calculate and rank the share of high-traffic recipes ----------------------
+
+traffic_by_category <- data %>%
+  group_by(category) %>%
+  summarise(
+    n = n(),
+    share_high = mean(traffic == "High", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(share_high)) %>%
+  mutate(
+    share_high = round(share_high, 3)
+  )
+
+print(traffic_by_category)
+
+
+# 2. Visualize the share of high-traffic recipes by category -------------------
+
+ggplot(
+  traffic_by_category,
+  aes(x = reorder(category, share_high), y = share_high)
+) +
+  geom_col(fill = "steelblue") +
+  geom_hline(
+    yintercept = mean(data$traffic == "High", na.rm = TRUE),
+    linetype = "dashed",
+    color = "red"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::label_percent()
+  ) +
+  labs(
+    title = "Share of High-Traffic Recipes by Category",
+    x = "Category",
+    y = "Share of High-Traffic Recipes"
+  ) +
+  theme_minimal()
+
+
+```
+
+**Comment:**
+
+The dashed red line is the overall share of High-traffic recipes. The categories are very different from each other: Vegetable, Potato and Pork are almost always High traffic, Meat and One Dish Meal are above average, while Beverages are almost never High traffic (Breakfast and Chicken are also below average). The category alone therefore separates the two classes very well, which anticipates the results of the models.
+
+
+## 2.2. Comparative Study
+
+### 2.2.1. Distribution of the variables: *calories, carbohydrates, sugar, and protein*
+
+```{r}
+# ==============================================================================
+# Exploratory Data Analysis: Calorie Distribution by Traffic Level
+# ==============================================================================
+
+ggplot(data, aes(x = calories, fill = traffic)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = 100,
+    color = "white",
+    position = "identity",
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = col_traffic) +
+  labs(
+    title = "Calorie Distribution by Traffic Level",
+    x = "Calories per Serving",
+    y = "Density",
+    fill = "Traffic Level"
+  ) +
+  theme_minimal()
+
+```
+**Comment: ** 
+
+For low-calorie dishes (0–100 kcal), the proportion is slightly higher for Low traffic recipes than for High traffic ones. For moderately calorie-dense dishes (100–500 kcal), the High traffic class tends to be more represented.
+
+Beyond 500 kcal, the proportions decrease, with only a few rare dishes exceeding 1500–2000 kcal.
+
+```{r}
+# ==============================================================================
+# Sugar Distribution by Traffic Level
+# ==============================================================================
+
+ggplot(data, aes(x = sugar, fill = traffic)) +
+  geom_histogram(
+    binwidth = 7,
+    color = "white",
+    position = "identity",
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = col_traffic) +
+  labs(
+    title = "Sugar Distribution by Traffic Level",
+    x = "Sugar per Serving",
+    y = "Count",
+    fill = "Traffic Level"
+  ) +
+  theme_minimal()
+
+```
+**Comment: ** 
+
+The vast majority of recipes contain  little sugar.
+
+For Low traffic recipes, there is a slightly longer tail, a few recipes have higher sugar content, but they remain rare.
+
+High traffic recipes are strongly concentrated around very low sugar levels, suggesting that popular recipes are generally low in sugar.
+
+Extreme sugar amounts (over 50 g) are very rare in both categories.
+
+
+```{r}
+# ==============================================================================
+# Protein Distribution by Traffic Level
+# ==============================================================================
+
+ggplot(data, aes(x = protein, fill = traffic)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = 15,
+    color = "white",
+    position = "identity",
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = col_traffic) +
+  labs(
+    title = "Protein Distribution by Traffic Level",
+    x = "Protein per Serving",
+    y = "Density",
+    fill = "Traffic Level"
+  ) +
+  theme_minimal()
+
+```
+**Comment**
+The protein content of recipes in the high_traffic and low_traffic classes appears to be relatively close , This can be explained by the fact that protein-rich recipes are present in both classes, although they differ in nature. Indeed, red meat–based recipes are much more prevalent in the high_traffic class, whereas white meat–based recipes are less in demand.
+
+```{r}
+
+# ==============================================================================
+# Carbohydrate Distribution by Traffic Level
+# ==============================================================================
+
+ggplot(data, aes(x = carbohydrate, fill = traffic)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = 10,
+    color = "white",
+    position = "identity",
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = col_traffic) +
+  labs(
+    title = "Carbohydrate Distribution by Traffic Level",
+    x = "Carbohydrates per Serving",
+    y = "Density",
+    fill = "Traffic Level"
+  ) +
+  theme_minimal()  
+```
+**Comment: ** Lower-carbohydrate recipes are more prevalent in the “Low Traffic” class.
+
+
+```{r}
+# ==============================================================================
+# Sugar-to-Calorie Ratio Distribution by Traffic Level
+# ==============================================================================
+
+ggplot(data, aes(x = su_cal, fill = traffic)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = 1,
+    color = "white",
+    position = "identity",
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = col_traffic) +
+  labs(
+    title = "Sugar-to-Calorie Ratio by Traffic Level",
+    x = "Sugar-to-Calorie Ratio",
+    y = "Density",
+    fill = "Traffic Level"
+  ) +
+  theme_minimal()
+```
+**Comment:** 
+
+Recipes with a lower sugar-to-calorie ratio are more prevalent in the “High Traffic” class
+
+*Remark:* with a bin width of 1, almost all recipes fall in the first bin (the ratio is below 1 for most of them), so this histogram is hard to read. The log-scale version below gives a more informative picture.
+
+```{r }
+
+# ==============================================================================
+# Protein-to-Sugar Ratio Distribution by Traffic Level
+# ==============================================================================
+
+ggplot(data, aes(x = pro_su, fill = traffic)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = 10,
+    color = "white",
+    position = "identity",
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = col_traffic) +
+  labs(
+    title = "Protein-to-Sugar Ratio by Traffic Level",
+    x = "Protein-to-Sugar Ratio",
+    y = "Density",
+    fill = "Traffic Level"
+  ) +
+  theme_minimal()
+
+```
+
+**Comment:** 
+
+It appears that a high protein-to-sugar ratio characterizes high-traffic recipes.
+
+**Histograms of the quantitative variables (whole sample)**
+
+Before comparing the two classes, we look at the shape of each quantitative variable on the whole sample, on the raw scale and on a logarithmic scale.
+
+```{r hist-all}
+vars_long <- data %>%
+  pivot_longer(cols = c(calories, carbohydrate, sugar, protein, su_cal, pro_su),
+               names_to = "variable", values_to = "value")
+
+# raw scale
+ggplot(vars_long, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Histograms of the quantitative variables (raw scale)", x = "value", y = "count")
+
+# log10 scale (values equal to 0 cannot be shown on a log scale)
+vars_long %>%
+  filter(value > 0) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Histograms of the quantitative variables (log10 scale)", x = "value (log10 scale)", y = "count")
+```
+
+**Comment:**
+
+On the raw scale, all six variables are strongly right-skewed: most recipes have small values and a few recipes have extreme ones. On the log scale the shapes are much more symmetric, which is why the log scale is used for the comparison between classes below.
+
+**Density plots by traffic level**
+
+To see whether a variable is distributed in the same way in the High-traffic and in the Low-traffic classes, we superimpose the density curves of the two classes. The reading is simple: if the two curves are almost identical, the variable does not help to separate the classes; if one curve is clearly shifted or has a different shape, the variable is a potential determinant of traffic.
+
+```{r density-by-class}
+vars_long %>%
+  filter(value > 0) %>%
+  ggplot(aes(x = value, fill = traffic, color = traffic)) +
+  geom_density(alpha = 0.35) +
+  scale_x_log10() +
+  scale_fill_manual(values = col_traffic) +
+  scale_color_manual(values = col_traffic) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Density of the quantitative variables by traffic level (log10 scale)",
+       x = "value (log10 scale)", y = "density", fill = "traffic", color = "traffic")
+```
+
+**Comment:**
+
+For all six variables the density curves of the two classes largely overlap. The shifts are small: the High-traffic curve is slightly shifted towards larger values for calories, carbohydrate, protein and the protein-to-sugar ratio, and towards smaller values for sugar and the sugar-to-calorie ratio. This is consistent with the medians and with the tests of comparison of means below.
+
+Hence, individually, the nutritional variables only weakly separate High from Low traffic recipes. This contrasts with the *category* of the recipe (share of High traffic from about 5% for Beverages to almost 100% for Vegetable), which gives a first idea of the determinant variables before any modelling.
+
+Because the variables are strongly right-skewed (a few extreme values stretch the x-axis), we complete the histograms and densities with boxplots on a logarithmic scale, which make the comparison of the two classes easier.
+
+
+
+```{r}
+# ==============================================================================
+# Distribution of Numeric Variables by Traffic Level
+# Logarithmic Scale (Base 10)
+# ==============================================================================
+data %>%
+  pivot_longer(cols = c(calories, carbohydrate, sugar, protein, su_cal, pro_su),
+               names_to = "variable", values_to = "value") %>%
+  filter(value > 0) %>%                       # log scale needs strictly positive values
+  ggplot(aes(x = traffic, y = value, fill = traffic)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_y_log10() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(title = "Numeric variables by traffic level (log10 scale)", 
+       x = "Traffic Level", 
+       y = "value (Log10 Scale)") +
+  theme_minimal() +
+  scale_fill_manual(values = col_traffic) +
+  theme(legend.position = "none")
+
+```
+
+**Comment:**
+
+On the log scale, the distributions of the two classes largely overlap for every nutritional variable: the medians differ only slightly. High-traffic recipes have a slightly higher median for calories, carbohydrates, protein and protein-to-sugar ratio, and a slightly lower median for sugar and sugar-to-calorie ratio. These differences are small compared with the differences observed between categories, which is consistent with the weak role of the nutritional variables in the models.
+
+### 2.2.2.Characteristics of high-traffic recipes
+```{r}
+
+# ==============================================================================
+# Separate Recipes by Traffic Level
+# ==============================================================================
+
+# High-traffic recipes
+high_traffic_data <- data %>%
+  dplyr::mutate(servings = as.factor(servings)) %>%
+  filter(traffic == "High")
+
+# Low-traffic recipes
+low_traffic_data <- data %>%
+  dplyr::mutate(servings = as.factor(servings)) %>%
+  filter(traffic == "Low")
+
+
+# Count recipes by number of servings
+high_traffic_data %>%
+  count(servings, sort = TRUE)
+
+# Count recipes by number of servings and category
+high_traffic_data %>%
+  count(servings, category, sort = TRUE)
+
+```
+
+
+
+```{r}
+
+# ==============================================================================
+# Number of Servings in High-Traffic Recipes
+# ==============================================================================
+
+ggplot(
+  data = high_traffic_data,
+  aes(x = forcats::fct_infreq(servings), fill = servings)
+) +
+  geom_bar(width = 0.8) +
+  scale_x_discrete(expand = expansion(mult = c(0.2, 0.2)))+
+  labs(
+    title = "Number of Servings in High-Traffic Recipes",
+    x = "Number of Servings",
+    y = "Count",
+    fill = "Servings"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Comment:** 
+
+Recipes with serving sizes of 4, followed by 6, are more prevalent in the “High Traffic” class. 
+
+However, 4 and 6 servings are also the most frequent values in the whole dataset: this is a matter of frequency, not necessarily of popularity (the share of High traffic by number of servings is examined in section 2.2.4).
+
+```{r}
+# ==============================================================================
+# Distribution of High-Traffic Recipes per category
+# ==============================================================================
+
+ggplot(data=high_traffic_data,aes(x = fct_rev(fct_infreq(category)), fill = category))+    
+  geom_bar() +
+  ylab("count") + 
+  xlab("category of recipe") +coord_flip() +
+ ggtitle("Distribution of High-traffic recipes per category")+
+  theme_minimal()
+
+```
+**Comment:** 
+
+The categories most represented in the “High Traffic” class are mainly potato, vegetable, pork, followed by meat.
+
+The least represented categories are beverages, chicken, and breakfast.
+
+
+```{r}
+# ==============================================================================
+# Distribution of High-Traffic by servings by Recipes 
+# ==============================================================================
+ggplot(data=high_traffic_data)+ 
+ geom_bar(mapping = aes(x=servings,fill=category), position="dodge")+
+   labs(y="Count",
+        x="servings", 
+        title="high traffic")   +
+    ggtitle("Distribution of High-traffic by servings by recipes")+ 
+    theme_bw()
+
+
+```
+
+**Comment**: 
+
+It is observed that the previous distribution (category distribution within the “High Traffic” class) remains relatively stable across all values of the servings variable. This suggests that the category variable plays an important role in the classification.
+
+### 2.2.3.Characteristics of Low-traffic recipes
+```{r}
+# ==============================================================================
+# Number of Servings in Low-Traffic Recipes
+# ==============================================================================
+ggplot(data=low_traffic_data,aes(x = fct_infreq(servings), fill = servings))+    
+  geom_bar() +
+  ylab("Count") + xlab(" servings")   +
+  ggtitle("Distribution of Low-traffic recipes by servings")+
+  theme_minimal()
+```
+
+**Comment:** 
+
+As in the “High Traffic” class, recipes serving 4 people are twice as prevalent in the “Low Traffic” class. The remaining values (2, 1, and 6) are almost equally represented.
+
+
+```{r , echo=FALSE}
+# ==============================================================================
+# Distribution of Low-Traffic Recipes per category
+# ==============================================================================
+ggplot(data=low_traffic_data,aes(x = fct_rev(fct_infreq(category)), fill = category))+    
+  geom_bar() +
+  ylab("count") + xlab("category of recipe") +coord_flip() +
+  ggtitle("Distribution of Low-traffic recipes by category")+
+  theme_minimal()
+```
+
+**Comment:** 
+
+In contrast to the “High Traffic” class, where recipes based on potato, vegetables, and pork are predominant and beverages, breakfast, and chicken recipes are underrepresented, the “Low Traffic” class exhibits an opposite pattern. In this class, beverages, breakfast, and chicken categories are more prevalent, while recipes based on vegetables, potato, and pork are less represented.
+This suggests that recipes based on potato, vegetables, and pork are more popular among consumers, whereas beverages, breakfast, and chicken-based recipes tend to attract lower demand.
+
+
+```{r}
+# ==============================================================================
+# Distribution of Low-Traffic by servings by Recipes 
+# ==============================================================================
+ggplot(data=low_traffic_data)+ 
+ geom_bar(mapping = aes(x=servings,fill=category), position="dodge")+
+ labs(y="Count", x=" servings", title="Distribution of Low-traffic by servings by recipes")   +
+ theme_bw()
+```
+**comment: **
+
+It is observed that the distribution of the category variable in the “Low Traffic” class remains almost constant across all values of the servings variable. There is a predominance of the beverages, breakfast, and chicken categories, while meat, potato, pork, and vegetables are less represented.
+
+
+
+### 2.2.4.Statistical summary of the two classes
+
+```{r}
+#================================ Summary of High-Traffic Recipes =================================
+
+summary_high <- high_traffic_data %>%
+  pivot_longer(
+    cols = c(calories, carbohydrate, sugar, protein, su_cal, pro_su),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  summarise(
+    mean   = round(mean(value), 2),
+    median = round(median(value), 2),
+    sd     = round(sd(value), 2),
+    min    = round(min(value), 2),
+    max    = round(max(value), 2),
+    .by = variable
+  )
+
+summary_high
+
+```
+
+
+```{r}
+#================================== Summary of Low-trafic class ======================================
+
+summary_low <- low_traffic_data %>%
+  pivot_longer(
+    cols = c(calories, carbohydrate, sugar, protein,su_cal,pro_su),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  summarize(
+    mean = round(mean(value),2),
+    median = round(median(value),2),
+    sd = round(sd(value),2),
+    min = round(min(value),2),
+    max = round(max(value),2),
+    .by = variable
+  )
+
+summary_low
+```
+**Comment: ** 
+
+The descriptive statistics tables summarizing the two classes show that, on average, High Traffic recipes are characterized by higher calorie content, lower sugar content, a higher sugar-to-calorie ratio, and a higher protein-to-sugar ratio compared to Low Traffic recipes. Regarding protein content, we observe that the mean values are relatively close across the two classes.
+
+**Important nuance:** the standard deviations are large compared to the means, and the maxima are extreme (a few recipes have a sugar-to-calorie ratio close to 100 or a protein-to-sugar ratio above 900). The **means are therefore strongly influenced by a few outliers**. This is why the mean of the sugar-to-calorie ratio is higher for High traffic recipes, while its **median** is slightly lower (which is consistent with the histogram and boxplot above). The medians are more reliable to compare the two classes, and the formal tests below rely on rank-based methods that are insensitive to outliers.
+
+**Comparison of the means between the two classes**
+
+For each quantitative variable, we compare the mean of the High-traffic class with the mean of the Low-traffic class using a **Welch t-test** (H0: the two means are equal; the test does not assume equal variances). Since the variables are skewed and contain outliers, we also run a **Wilcoxon rank-sum test** (H0: same distribution in the two classes, no normality assumption). The p-values are corrected for the 6 simultaneous tests with the Holm method.
+
+```{r means-test}
+#====================== Comparison of Numerical Variables by Traffic Class ======================
+
+num_vars <- c("calories", "carbohydrate", "sugar", "protein", "su_cal", "pro_su")
+
+# Perform Welch's t-test and Wilcoxon rank-sum test for each variable
+tests_raw <- map_dfr(num_vars, function(v) {
+
+  tt <- t.test(data[[v]] ~ data$traffic)
+  wt <- wilcox.test(data[[v]] ~ data$traffic)
+
+  tibble(
+    variable    = v,
+    mean_High   = unname(tt$estimate[1]),
+    mean_Low    = unname(tt$estimate[2]),
+    median_High = median(data[[v]][data$traffic == "High"]),
+    median_Low  = median(data[[v]][data$traffic == "Low"]),
+    p_ttest     = tt$p.value,
+    p_wilcoxon  = wt$p.value
+  )
+}) %>%
+  mutate(
+    p_ttest_holm    = p.adjust(p_ttest, method = "holm"),
+    p_wilcoxon_holm = p.adjust(p_wilcoxon, method = "holm")
+  )
+
+# Display results with rounded statistics and formatted p-values
+tests_raw %>%
+  mutate(
+    across(
+      c(mean_High, mean_Low, median_High, median_Low),
+      ~ round(.x, 3)
+    ),
+    across(
+      c(p_ttest, p_wilcoxon, p_ttest_holm, p_wilcoxon_holm),
+      ~ format.pval(.x, digits = 3, eps = 0.001)
+    )
+  )
+
+# Identify variables with statistically significant differences after Holm correction
+sig_t <- tests_raw$variable[tests_raw$p_ttest_holm < 0.05]
+sig_w <- tests_raw$variable[tests_raw$p_wilcoxon_holm < 0.05]
+```
+
+**Comment:**
+
+At the 5% level (after Holm correction), the means of the two classes are significantly different for: `r lst(sig_t)` (t-test). The distributions are significantly different for: `r lst(sig_w)` (Wilcoxon test). When both tests agree, the conclusion is robust to skewness and outliers; when they disagree, the difference in means is mainly driven by a few extreme recipes (as noticed with the sugar-to-calorie ratio).
+
+A significant p-value does not mean an important effect: the differences between the means must also be compared with the standard deviations given in the summary tables above, and they remain small. Statistical significance and practical importance are two different things.
+
+We now run the same kind of analysis for the two discrete variables.
+
+```{r chi-tests}
+#====================== Association Between Categorical Variables and Traffic ======================
+
+# Chi-squared tests of independence
+chi_cat <- chisq.test(table(data$category, data$traffic))
+chi_srv <- chisq.test(table(data$servings, data$traffic))
+
+# Summarize test results and effect sizes
+tibble(
+  variable  = c("category", "servings"),
+  chi2      = round(c(chi_cat$statistic, chi_srv$statistic), 2),
+  p_value   = format.pval(
+    c(chi_cat$p.value, chi_srv$p.value),
+    digits = 3,
+    eps = 0.001
+  ),
+  cramers_v = round(
+    sqrt(c(chi_cat$statistic, chi_srv$statistic) / nrow(data)),
+    3
+  )
+)
+
+# Proportion of high-traffic recipes by number of servings
+data %>%
+  group_by(servings) %>%
+  summarize(
+    n = n(),
+    share_high = round(mean(traffic == "High"), 3)
+  )
+```
+
+**Comment:**
+
+The association between *category* and *traffic* is very strong (very small p-value and a large Cramér's V), whereas the number of servings is not clearly related to traffic (the share of High traffic is almost the same whatever the number of servings). For the nutritional variables, the differences between the two classes are small in magnitude compared with the category effect. The EDA therefore points to the **category as the main determinant** of traffic, which the models below confirm.
+
+### Categories with the highest sugar-to-calories ratio 
+```{r}
+# ===================== highest sugar-to-calories ratio for high-traffic recipes ======================
+data%>% 
+  filter(traffic=="High")%>%
+  dplyr::select(category,sugar,calories,su_cal)%>%
+  group_by(category)%>%
+  summarize(mean=round(mean(su_cal),2))%>% arrange(desc(mean))%>%
+  slice(1:3)
+
+```
+
+```{r}
+# ====================== highest sugar-to-calories ratio for Low-traffic recipes ======================
+data%>% 
+  filter(traffic=="Low")%>%
+  dplyr::select(category,sugar,calories,su_cal)%>%
+  group_by(category)%>%
+  summarize(mean=round(mean(su_cal),2))%>% arrange(desc(mean))%>%
+  slice(1:3)
+
+```
+
+
+### Categories with the highest protein-to-sugar ratio 
+```{r}
+# ================= highest protein-to-sugar ratio for High-traffic recipes ==========================
+data%>% 
+  filter(traffic=="High")%>%
+  dplyr::select(category,sugar,calories,pro_su)%>%
+  group_by(category)%>%
+  summarize(mean=round(mean(pro_su),2))%>% arrange(desc(mean))%>%
+  slice(1:3)
+
+```
+
+```{r}
+# ===================== highest protein-to-sugar ratio for Low-traffic recipes ======================
+data%>% 
+  filter(traffic=="Low")%>%
+  dplyr::select(category,sugar,calories,pro_su)%>%
+  group_by(category)%>%
+  summarize(mean=round(mean(pro_su),2))%>% arrange(desc(mean))%>%
+  slice(1:3)
+
+``` 
+**Comment: **
+For both classes, the categories of recipes with high sugar-to-calorie ratios are predominantly beverages and desserts.
+
+For both classes, the categories of recipes with high protein-to-sugar ratios are predominantly Chicken and Chicken Breast.
+
+## 2.3.Correlation matrix of the independant variables 
+```{r}
+#========================== correlation matrix =================================
+
+corr_matrix <- data %>%
+  dplyr::select(calories, carbohydrate, sugar, protein, su_cal,pro_su) %>%
+  cor(use = "complete.obs")
+
+corrplot(corr_matrix,
+         method = "color",       # couleurs
+         type = "upper",         # triangle supérieur
+         col = colorRampPalette(c("blue", "white", "red"))(200),   # diverging palette: blue = negative, red = positive
+         addCoef.col = "black",  # afficher les valeurs
+         tl.col = "black",
+         tl.srt = 45)
+
+# Largest absolute correlation between two different variables
+round(max(abs(corr_matrix[upper.tri(corr_matrix)])), 2)
+
+```
+
+**Comment:** 
+
+The calculation of the correlation matrix shows a very low correlation between the independent variables (the largest one, in absolute value, is about `r round(max(abs(corr_matrix[upper.tri(corr_matrix)])), 2)`), which means that there is no collinearity problem among these variables.
+
+*Remark:* Pearson correlations can be affected by the outliers mentioned above, and the two ratios are built from the other variables. We therefore confirm the absence of collinearity with variance inflation factors (VIF) once the logit model is estimated (section 4.2).
+
+```{r}
+#====================== Traffic Variable Encoding 0/1======================
+data<- data%>%
+  mutate(
+    traffic = ifelse(traffic == "High", 1, 0),
+    traffic_fact = factor(traffic,
+                          levels = c(0,1), 
+                          labels = c("Low","High"))
+  )
+
+# "traffic" (0/1) is used by the LPM and the logit; "traffic_fact" (Low/High) by the random forest and yardstick
+table(data$traffic, data$traffic_fact)
+glimpse(data)
+
+```
+# 3. Data splitting
+
+We split our dataset into training (70%) and testing (30%) sets, using stratified sampling based on the target variable :traffic.
+
+```{r}
+# ==============================
+# TRAIN / TEST SPLIT
+# ==============================
+set.seed(123)
+indices <- initial_split(data, 
+                         prop = 0.7,
+                         strata = traffic_fact)
+train <- training(indices)
+test <- testing(indices)
+
+# Check: both sets must have the same class proportions as the full data
+cat("Training set dimensions:",dim(train))
+cat("\nTesting set dimensions :",dim(test))
+
+cat("Class proportions in the training set:\n")
+round(prop.table(table(train$traffic_fact)), 3) %>% print()
+
+cat("\nClass proportions in the test set:\n")
+round(prop.table(table(test$traffic_fact)), 3) %>% print()
+```
+
+The training set is used to estimate the models (and to tune the random forest by cross-validation); the test set is only used at the end, to compare the models on observations they have never seen.
+
+# 4. Estimation
+We aim to estimate the variable 'traffic' based on the 8 independent variables.according to the formula:
+```{r}
+
+#  FORMULA 
+
+form2 <- traffic ~ servings + category + calories + protein + sugar + carbohydrate + su_cal + pro_su
+
+```
+
+
+## 4.1. LPM model
+
+
+```{r}
+
+# ==============================================================================
+#  1. LPM
+# ==============================================================================
+plm_fit <- lm(form2, data=train)
+summary(plm_fit)
+
+# Automatic summary of the LPM coefficients (used in the comment below)
+coef_plm <- summary(plm_fit)$coefficients
+coef_plm <- coef_plm[rownames(coef_plm) != "(Intercept)", , drop = FALSE]
+is_cat   <- grepl("^category", rownames(coef_plm))
+lst      <- function(x) if (length(x) == 0) "none" else paste(x, collapse = ", ")
+
+n_cat      <- sum(is_cat)
+n_cat_sig  <- sum(is_cat & coef_plm[, "Pr(>|t|)"] < 0.05)
+sig_num    <- rownames(coef_plm)[!is_cat & coef_plm[, "Pr(>|t|)"] < 0.05]
+pos_num    <- rownames(coef_plm)[!is_cat & coef_plm[, "Estimate"] > 0]
+neg_num    <- rownames(coef_plm)[!is_cat & coef_plm[, "Estimate"] < 0]
+```
+
+**Comment**:
+Taking into account the p-values at a significance level of 5%, we observe that `r n_cat_sig` of the `r n_cat` category coefficients are significant. Each category has a relatively high positive coefficient, which means that each category has a positive effect relative to the reference category (Beverages).
+
+Among the other variables, the ones that are significant at 5% are: `r lst(sig_num)`. The variables with a positive (but, in general, non-significant) estimated effect are: `r lst(pos_num)`; the variables with a negative estimated effect are: `r lst(neg_num)`.
+
+*Remark:* in a linear probability model the errors are heteroskedastic by construction, so the usual standard errors are only approximate. We therefore check the conclusions with heteroskedasticity-robust standard errors (HC1).
+
+```{r}
+# LPM with heteroskedasticity-robust standard errors
+lmtest::coeftest(plm_fit, vcov. = sandwich::vcovHC(plm_fit, type = "HC1"))
+```
+
+The conclusions are unchanged with robust standard errors: the significant effects remain those of the recipe categories.
+
+## 4.2. Logit model
+
+```{r}
+# ==============================
+#  2. LOGIT 
+# ==============================
+logit_fit <- glm(form2, data=train, family="binomial")
+
+```
+
+Before reading the results, we check the number of High/Low recipes in each category of the training set. If a category contains (almost) only one class, the logit may suffer from (quasi-)complete separation, which inflates its coefficient and standard error.
+
+```{r}
+table(train$category, train$traffic_fact)
+```
+
+Vegetable and Potato recipes are almost exclusively High traffic. This is a real feature of the data, but it means that the logit *coefficients* of these categories can be very large and imprecise; this is why the interpretation relies mainly on **marginal effects** (probabilities, always bounded between 0 and 1) rather than on raw coefficients.
+
+```{r, results='asis'}
+stargazer(plm_fit, logit_fit, title="Estimation results", type="html",
+          column.labels = c("LPM", "Logit"))
+```
+
+**Comment:**
+The results of the logistic model show the same significant variables (all categories) and the same signs as the PLM model
+
+```{r}
+# ---- Odds ratios (exp of the coefficients) with 95% Wald confidence intervals ----
+or_tab <- exp(cbind(OR = coef(logit_fit), confint.default(logit_fit)))
+round(or_tab, 3)
+
+# ---- Global quality of the logit: McFadden pseudo-R2 and likelihood-ratio test vs null model ----
+null_fit <- glm(traffic ~ 1, data = train, family = "binomial")
+mcfadden <- 1 - as.numeric(logLik(logit_fit) / logLik(null_fit))
+round(mcfadden, 3)
+anova(null_fit, logit_fit, test = "Chisq")
+
+# ---- Multicollinearity: (generalized) variance inflation factors ----
+car::vif(logit_fit)
+```
+
+**Comment:**
+
+The odds ratios of the categories are far above 1 compared with Beverages (the reference), whereas those of the nutritional variables are close to 1. The likelihood-ratio test shows that the model is significantly better than a model with no predictor. The VIF values (the last column, GVIF^(1/(2*Df)), is the comparable one) are close to 1, which confirms that there is no multicollinearity problem, even with the two ratio variables.
+
+## 4.3. Comparaison of marginal effects of the two models 
+```{r}
+
+# =============================== Marginal effects =======================================
+
+# Marginal Effects at the Mean (MEM)
+me_mem <- logitmfx(form2, data=train, atmean=TRUE) 
+
+# Average Marginal Effects (AME)
+me_ame <- logitmfx(form2, data=train, atmean=FALSE)
+
+# Safety check: the three columns below must refer to the same variables, in the same order
+stopifnot(nrow(me_mem$mfxest) == length(plm_fit$coefficients) - 1,
+          nrow(me_ame$mfxest) == length(plm_fit$coefficients) - 1)
+
+ME <- cbind(me_mem$mfxest[,"dF/dx"], me_ame$mfxest[,"dF/dx"], plm_fit$coefficients[-1])
+colnames(ME) <- c("MEM","AME","PLM")
+round(ME,4)
+
+
+```
+**Comment:**
+For the logistic model, we analyzed both the marginal effects at the mean (MEM) and the average marginal effects (AME) to better understand the impact of each explanatory variable on the probability of observing high traffic. A comparison between these marginal effects and the coefficients obtained from the PLM model shows that the values are relatively close, with the same signs as the PLM effects. This indicates that the direction and relative importance of the explanatory variables, particularly the recipe categories, are consistent across both modeling approaches. Overall, the marginal effects confirm that the category of the recipe remains the primary determinant of high traffic, while the numerical variables and portion sizes have negligible or non-significant contributions.
+
+*Reading guide:* a marginal effect is expressed in **probability points**: an AME of 0.40 for a category means that, on average, the probability of High traffic is 40 percentage points higher than for the reference category (Beverages), all other variables being equal. For a numeric variable, it is the change in probability for a one-unit increase of this variable.
+
+## 4.4. Variable importance score
+
+```{r}
+# t-statistics variable importance 
+
+# Extraction des t-statistics
+varimp_logit <- tibble(
+  variable = rownames(me_ame$mfxest),
+  t_score  = me_ame$mfxest[, "dF/dx"] / me_ame$mfxest[, "Std. Err."]
+) %>%
+  arrange(desc(abs(t_score))) %>%
+  mutate(variable = factor(variable, levels = variable[order(abs(t_score))]))
+
+# Plot
+ggplot(varimp_logit, aes(x = variable, y = t_score)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  ggtitle("Logit: Variable Importance Based on AME t-statistics") +
+  theme_bw()
+```
+
+### 4.4.1. Interpretation of the results:
+
+The importance of the variables, measured by the t-stats of the marginal effects, reveals that the type of dish (category) is the determining factor in a recipe's success. The Vegetable and Potato categories are the most attractive compared to beverages.
+
+Conversely, the Chicken Breast, Chicken, and Breakfast categories are the least attractive among the positive contributors.
+
+Nutritional indicators such as protein, sugar, carbohydrates, calories, sugar/calorie, and protein/sugar play a marginal role. Some even have a slightly negative influence on traffic, such as sugar and the sugar/calorie ratio. Overall, nutritional content is not a determining variable in the classification of recipes.
+
+The number of servings of a recipe (the servings variable) is not a determining factor in the classification of recipes.
+
+ 
+## 4.5. Regularized logistic regression (LASSO)
+
+Many explanatory variables (the nutritional variables and servings) seem to contribute little to the model. To keep only the useful variables, we estimate a **penalised logistic regression (LASSO, L1 penalty)**: the coefficients maximise the log-likelihood minus a penalty $\lambda \sum_j |\beta_j|$. The larger $\lambda$ is, the more the coefficients are shrunk, and some of them are set **exactly to zero**, which removes the corresponding variables from the model.
+
+The penalty parameter $\lambda$ is chosen by 10-fold cross-validation on the training set, with the AUC as criterion. Two classical values are examined: `lambda.min` (the best AUC) and `lambda.1se` (the most parsimonious model whose AUC is within one standard error of the best one). We use `lambda.1se` to select the variables and to predict.
+
+```{r lasso}
+#====================== LASSO Logistic Regression with Cross-Validation ======================
+
+# Create the design matrix with dummy variables for categorical predictors
+# Reference category for "category": Beverages
+# glmnet standardizes predictors internally before applying the penalty
+x_train <- model.matrix(form2, data = train)[, -1]
+y_train <- train$traffic_fact
+
+# Fit LASSO with 10-fold cross-validation, using AUC as the selection criterion
+set.seed(123)
+
+cv_lasso <- cv.glmnet(
+  x_train,
+  y_train,
+  family = "binomial",
+  alpha = 1,              # LASSO penalty
+  nfolds = 10,
+  type.measure = "auc"
+)
+
+# Plot cross-validated AUC as a function of lambda
+plot(cv_lasso)
+
+# Plot coefficient paths as lambda increases
+plot(
+  cv_lasso$glmnet.fit,
+  xvar = "lambda",
+  label = TRUE
+)
+
+# Highlight lambda.1se with a vertical dashed line
+abline(v = log(cv_lasso$lambda.1se), lty = 2)
+
+# Display the lambda values minimizing cross-validation error and applying the 1-SE rule
+c(
+  lambda_min = cv_lasso$lambda.min,
+  lambda_1se = cv_lasso$lambda.1se
+)
+```
+
+```{r lasso-coefs}
+#====================== LASSO Coefficients and Variable Selection ======================
+
+# Extract coefficients for lambda.min and lambda.1se
+# A coefficient equal to zero indicates that the variable is excluded from the model
+lasso_coefs <- tibble(
+  term       = rownames(coef(cv_lasso, s = "lambda.min")),
+  lambda_min = as.matrix(coef(cv_lasso, s = "lambda.min"))[, 1],
+  lambda_1se = as.matrix(coef(cv_lasso, s = "lambda.1se"))[, 1]
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(retained_1se = lambda_1se != 0)
+
+# Display coefficient estimates
+kable(lasso_coefs, digits = 4)
+
+# Identify retained and excluded variables using the 1-SE rule
+kept_1se <- lasso_coefs$term[lasso_coefs$lambda_1se != 0]
+
+dropped_1se <- lasso_coefs$term[lasso_coefs$lambda_1se == 0]
+```
+
+**Comment:**
+
+With `lambda.1se`, the LASSO keeps `r length(kept_1se)` of the `r nrow(lasso_coefs)` coefficients. Variables **kept**: `r lst(kept_1se)`. Variables **removed** (coefficient exactly equal to zero): `r lst(dropped_1se)`.
+
+This selection can be compared with the marginal effects of section 4.3: the variables removed by the LASSO are those whose effect was negligible or not significant in the logit, while the recipe categories (the main determinants) are kept. The LASSO therefore confirms, with a method designed for variable selection, that the nutritional content and the number of servings add little once the category is known.
+
+*Remark:* the LASSO coefficients are shrunk towards zero (they are biased on purpose), so they are used for **selection and prediction**, not for interpretation or inference. The predictive performance of the LASSO is compared with the other models in section 6.
+
+# 5. Random Forest (RF) model
+
+For tuning the mtry parameter of the Random Forest model, we performed a 10-fold cross-validation.
+
+We perform the tuning of the mtry parameter by evaluating several values using accuracy and AUC.
+
+The average performance across the 10 folds is then aggregated and stored in order to identify the optimal value of mtry
+
+The cross-validation is done **on the training set only**: the test set stays untouched, so that the final comparison of the models is not contaminated by the tuning step.
+
+```{r}
+#=================== Random Forest: Cross-Validation and Hyperparameter Tuning ======================
+
+# Set random seed and detect available CPU cores
+set.seed(123)
+cores <- parallel::detectCores()
+
+#---------------------- 10-Fold Cross-Validation ----------------------
+
+folds <- vfold_cv(
+  train,
+  v = 10,
+  strata = traffic_fact
+)
+
+#---------------------- Random Forest Formula ----------------------
+
+# Use a factor response for classification and probability estimation
+form_rf <- traffic_fact ~ servings + category + calories + protein +
+  sugar + carbohydrate + su_cal + pro_su
+
+#---------------------- Random Forest Fitting Function ----------------------
+
+rf_model <- function(splits, mtry) {
+
+  rf_fit <- ranger::ranger(
+    formula = form_rf,
+    data = analysis(splits),
+    mtry = mtry,
+    num.threads = cores,
+    importance = "impurity",
+    probability = TRUE,
+    # Order unordered factor levels by their class proportions before splitting
+    respect.unordered.factors = "order"
+  )
+
+  # Extract validation data and generate predictions
+  holdout <- assessment(splits)
+  predictions <- predict(rf_fit, data = holdout, type = "response")
+
+  holdout$prob_rf <- predictions$predictions[, "High"]
+  holdout$class_rf <- factor(
+    ifelse(holdout$prob_rf > 0.5, "High", "Low"),
+    levels = c("Low", "High")
+  )
+
+  # Retain the observed class, predicted probability and predicted class
+  holdout %>%
+    dplyr::select(traffic_fact, prob_rf, class_rf)
+}
+
+#---------------------- Hyperparameter Tuning: mtry ----------------------
+
+# mtry represents the number of predictors randomly considered at each split
+# With 8 predictors, mtry = 8 corresponds to bagging
+
+mtry_seq <- 2:8
+
+results <- matrix(
+  NA_real_,
+  nrow = length(mtry_seq),
+  ncol = 3,
+  dimnames = list(NULL, c("mtry", "accuracy", "auc"))
+)
+
+for (i in seq_along(mtry_seq)) {
+
+  # Fit the model on each fold and predict the corresponding validation set
+  folds$results <- purrr::map(
+    folds$splits,
+    rf_model,
+    mtry = mtry_seq[i]
+  )
+
+  # Calculate accuracy for each fold
+  folds$accuracy <- purrr::map_dbl(
+    folds$results,
+    ~ mean(.x$traffic_fact == .x$class_rf)
+  )
+
+  # Calculate AUC for each fold
+  folds$AUC <- purrr::map_dbl(
+    folds$results,
+    ~ yardstick::roc_auc(
+      .x,
+      truth = traffic_fact,
+      prob_rf,
+      event_level = "second"
+    )$.estimate
+  )
+
+  # Store mean cross-validated performance
+  results[i, "mtry"] <- mtry_seq[i]
+  results[i, "accuracy"] <- mean(folds$accuracy)
+  results[i, "auc"] <- mean(folds$AUC)
+}
+
+#---------------------- Cross-Validation Results ----------------------
+
+results <- as_tibble(results)
+
+kable(results, digits = 4)
+```
+
+
+```{r}
+
+#=========================  Graphique performance mtry =======================================
+
+cols <- c("accuracy"="blue", "auc"="red")
+ggplot(results, aes(x = mtry)) +
+geom_point(aes(y = accuracy, color = "accuracy")) +
+geom_line(aes(y = accuracy, color = "accuracy")) +
+geom_point(aes(y = auc, color = "auc")) +
+geom_line(aes(y = auc, color = "auc")) +
+theme_bw() +
+scale_colour_manual(name="metrics", values=cols) +
+theme(legend.position = "top")
+
+```
+
+```{r}
+
+# ========================== Best mtry according to AUC ============================
+
+m_op <- results$mtry[which.max(results$auc)]
+print(m_op)
+
+```
+
+```{r}
+#===============================================================
+# Final RF model
+#==============================================================
+# Same formula (form_rf, factor response) and same options as in the cross-validation
+
+set.seed(123)
+rf.fit_final <- ranger(
+formula = form_rf,
+data = train,
+mtry = m_op,
+num.threads = cores,
+importance = "impurity",
+probability = TRUE,
+respect.unordered.factors = "order"
+)
+
+```
+
+**Comment** 
+From the AUC plot, we observe that the optimal mtry value maximizes the AUC, with mtry equal to `r m_op`. We will use this optimal value to define the final Random Forest model, which will be used for the prediction step.
+
+Note that the cross-validated accuracy and AUC vary only slightly with mtry (see the table above): the choice of mtry is not critical for this problem.
+
+## 5.1.  the variable importance scores
+```{r}
+# ------------------------------
+# Variable Importance
+# ------------------------------
+
+VIMP_rf <- tibble(
+                Variable = names(rf.fit_final$variable.importance),
+                Importance = rf.fit_final$variable.importance) %>% 
+         arrange(desc(Importance)) %>%
+         mutate(Variable = factor(Variable, levels=Variable[order(Importance)]))
+
+ggplot(VIMP_rf, aes(reorder(Variable, Importance), Importance)) +
+geom_col() +
+coord_flip() +
+theme_bw() +
+ggtitle("Importance des variables - RF")
+```
+
+```{r}
+# ---------------------------------
+# Check with permutation importance
+# ----------------------------------
+
+
+set.seed(123)
+rf.fit_perm <- ranger(
+formula = form_rf,
+data = train,
+mtry = m_op,
+num.threads = cores,
+importance = "permutation",
+probability = TRUE,
+respect.unordered.factors = "order"
+)
+
+tibble(Variable = names(rf.fit_perm$variable.importance),
+       Importance = rf.fit_perm$variable.importance) %>%
+  ggplot(aes(reorder(Variable, Importance), Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  theme_bw() +
+  ggtitle("Permutation importance - RF")
+```
+
+## 5.2. Interpretation of the results.
+
+The Random Forest (RF) variable importance plot provides a clear hierarchy of which features contribute most to the model's ability to classify recipe traffic
+
+Dominance of 'Category': The category variable is by far the most influential predictor in the model, with an importance score significantly higher than all other features.
+
+Secondary Role of Nutritional Metrics: Unlike the Logit model where nutritional variables were nearly negligible, the Random Forest model assigns them moderate importance. Protein and the protein-to-sugar ratio (pro_su) follow the category in importance, suggesting that while the dish type comes first, the protein content provides additional predictive power in a non-linear context.
+
+Other Nutritional Factors: Carbohydrates, sugar, calories, and the sugar-to-calorie ratio (su_cal) show similar levels of moderate importance. They contribute to the model's accuracy, though they are secondary to the overall category of the meal.
+
+Least Influential Variable: The servings variable has the lowest importance score, indicating it has very little impact on the model's classification performance compared to the ingredients and nutritional profile.
+
+*Caution:* the impurity importance gives a moderate score to continuous variables partly because they offer many possible split points. The permutation importance (second graph) is used as a check: the dominance of *category* is the robust conclusion, and it is shared with the logit model. The secondary ranking of the nutritional variables should be read with caution.
+
+
+# 6. Prediction 
+
+## 6.1. Prediction using your models (LPM, Logit, LASSO, RF) and the test data
+```{r}
+
+# ======================= Prediction  ===================================
+
+# ----------PLM model ---------------------------------------------------
+test$prob_plm <- predict(plm_fit, newdata=test)
+test$class_plm <- factor(ifelse(test$prob_plm>0.5,1,0),
+                        levels=c(0,1), 
+                        labels=c("Low","High")) 
+
+
+# --------- RF model ----------------------------------------------------
+test$prob_rf <- predict(rf.fit_final, test, type="response")$predictions[, "High"]
+test$class_rf <- factor(ifelse(test$prob_rf > 0.5, 1, 0),
+                        levels=c(0,1), 
+                        labels=c("Low","High"))
+
+# --------- logit model -------------------------------------------------
+test$prob_logit <- predict(logit_fit, newdata=test, type="response")
+test$class_logit <- factor(ifelse(test$prob_logit>0.5,1,0),
+                          levels=c(0,1), 
+                          labels=c("Low","High")) 
+
+# --------- LASSO model (penalised logit, lambda.1se) --------------------
+x_test <- model.matrix(form2, data = test)[, -1]
+test$prob_lasso <- as.numeric(predict(cv_lasso, newx = x_test, s = "lambda.1se", type = "response"))
+test$class_lasso <- factor(ifelse(test$prob_lasso > 0.5, 1, 0),
+                           levels = c(0, 1),
+                           labels = c("Low", "High"))
+
+# A linear probability model can predict "probabilities" outside [0, 1]: how many in the test set?
+n_out_plm <- sum(test$prob_plm < 0 | test$prob_plm > 1)
+
+
+```
+
+The classification rule is the usual one: a recipe is predicted "High" when its predicted probability is above 0.5. The LPM produces  predicted "probabilities" outside the interval [0, 1] on the test set, which is a known limitation of this model (the logit and the random forest always return values between 0 and 1).
+
+## 6.2. comparaison of  the performance of the models using confusion matrices, ROCs and AUCs.
+```{r}
+#====================== Confusion Matrices for Model Evaluation ======================
+
+# Define a function to extract confusion matrix counts
+cm_counts <- function(truth, pred) {
+  tab <- table(Truth = truth, Prediction = pred)
+
+  c(
+    TN = tab["Low", "Low"],
+    FP = tab["Low", "High"],
+    FN = tab["High", "Low"],
+    TP = tab["High", "High"]
+  )
+}
+
+# Compute confusion matrix counts for each model on the test set
+cm_plm   <- cm_counts(test$traffic_fact, test$class_plm)
+cm_logit <- cm_counts(test$traffic_fact, test$class_logit)
+cm_rf    <- cm_counts(test$traffic_fact, test$class_rf)
+cm_lasso <- cm_counts(test$traffic_fact, test$class_lasso)
+
+# Number of observations in the test set
+n_test <- nrow(test)
+```
+
+```{r}
+# Confusion Matrix : plm model
+ test%>% 
+  yardstick::conf_mat(truth=traffic_fact,estimate=class_plm)%>%
+  autoplot(type="heatmap")+
+  labs(title = "Confusion Matrix – PLM")
+  
+```
+ **Comment:**
+ 
+ The LPM model successfully predicted `r cm_plm["TN"] + cm_plm["TP"]` out of `r n_test` observations. Among these, `r cm_plm["TN"]` are true negatives and `r cm_plm["TP"]` are true positives. On the other hand, it incorrectly predicted `r cm_plm["FP"]` observations of the “Low” (FP) class and `r cm_plm["FN"]` observations of the “High” class( FN).
+
+```{r}
+# Confusion Matrix : logit model
+
+  test%>% 
+  yardstick::conf_mat(truth=traffic_fact,estimate=class_logit)%>%
+  autoplot(type="heatmap")+
+  labs(title = "Confusion Matrix – Logit model")
+
+```
+**Comment: **
+
+ The Logit model successfully predicted `r cm_logit["TN"] + cm_logit["TP"]` out of `r n_test` observations. Among these, `r cm_logit["TN"]` are true negatives and `r cm_logit["TP"]` are true positives. On the other hand, it incorrectly predicted `r cm_logit["FP"]` observations of the “Low” (FP) class and `r cm_logit["FN"]` observations of the “High” class( FN).
+
+```{r}
+# Confusion Matrix : RF model
+    test%>% 
+  yardstick::conf_mat(truth=traffic_fact,estimate=class_rf)%>%
+  autoplot(type="heatmap")+
+  labs(title = "Confusion Matrix – RF model")
+   
+```
+
+**Comment: **
+
+ The Random Forest model successfully predicted `r cm_rf["TN"] + cm_rf["TP"]` out of `r n_test` observations. Among these, `r cm_rf["TN"]` are true negatives and `r cm_rf["TP"]` are true positives. On the other hand, it incorrectly predicted `r cm_rf["FP"]` observations of the “Low” (FP) class and `r cm_rf["FN"]` observations of the “High” class( FN).
+
+```{r}
+# Confusion Matrix : LASSO model
+  test%>% 
+  yardstick::conf_mat(truth=traffic_fact,estimate=class_lasso)%>%
+  autoplot(type="heatmap")+
+  labs(title = "Confusion Matrix – Lasso model")
+
+```
+
+**Comment: **
+
+ The LASSO model successfully predicted `r cm_lasso["TN"] + cm_lasso["TP"]` out of `r n_test` observations. Among these, `r cm_lasso["TN"]` are true negatives and `r cm_lasso["TP"]` are true positives. On the other hand, it incorrectly predicted `r cm_lasso["FP"]` observations of the “Low” (FP) class and `r cm_lasso["FN"]` observations of the “High” class( FN).
+
+```{r}
+# ===========================================
+#                ROC curve 
+# ===========================================
+
+roc_lpm_test <- yardstick::roc_curve(test, truth=traffic_fact, prob_plm, event_level="second")%>%
+                mutate(Model = "PLM")%>%
+                dplyr::select(specificity, sensitivity,Model) 
+                
+roc_logit_test <- yardstick::roc_curve(test, truth=traffic_fact, prob_logit, event_level="second")%>%
+                 mutate(Model = "Logit")%>%
+                 dplyr::select(specificity, sensitivity,Model)
+             
+  
+roc_rf_test  <- yardstick::roc_curve(test,  truth = traffic_fact, prob_rf,event_level = "second")%>%
+                 mutate(Model = "Random Forest")%>%
+                 dplyr::select(specificity, sensitivity,Model) 
+                 
+
+roc_lasso_test <- yardstick::roc_curve(test, truth=traffic_fact, prob_lasso, event_level="second")%>%
+                 mutate(Model = "LASSO")%>%
+                 dplyr::select(specificity, sensitivity,Model)
+
+roc_all<-bind_rows(roc_lpm_test,roc_logit_test,roc_lasso_test,roc_rf_test)
+
+
+roc_all%>%
+  ggplot(aes(x=1-specificity,y=sensitivity,color=Model))+
+   geom_path()+
+  geom_abline(lty=2)+
+  coord_equal()+ theme_bw()+
+  scale_color_manual(name="Models",values = c("Logit"="black","PLM"="red","LASSO"="darkgreen","Random Forest"="blue"))+
+  theme(legend.position="top")
+  
+```
+**Comment:**
+
+The curves are very close to each other and lie well above the dashed diagonal line (the diagonal is the performance of a random guess).
+
+The fact that the curves almost completely overlap indicates that the Logit, PLM, LASSO and Random Forest models have very similar discrimination abilities.
+
+The area under the curve (AUC) is high, which is considered a good performance for a classification model.
+
+We observe that to achieve a sensitivity of 0.75 (capturing 75% of High Traffic recipes), the model accepts a false positive rate of approximately 0.25 (1 − specificity).
+
+```{r}
+# ===========================================
+#                AUC 
+# ===========================================
+
+auc_rf_test  <- yardstick::roc_auc(test,  truth = traffic_fact, prob_rf,event_level = "second")%>%
+                  mutate(Model = "Random Forest")
+auc_plm_test  <- yardstick::roc_auc(test,  truth = traffic_fact, prob_plm,event_level = "second")%>%
+                   mutate(Model = "PLM")
+auc_logit_test <- yardstick::roc_auc(test,  truth = traffic_fact, prob_logit,event_level = "second")%>%
+                  mutate(Model = "Logit")
+  
+auc_lasso_test <- yardstick::roc_auc(test,  truth = traffic_fact, prob_lasso,event_level = "second")%>%
+                  mutate(Model = "LASSO")
+
+auc_tab <- bind_rows(auc_rf_test,auc_plm_test,auc_logit_test,auc_lasso_test )%>%arrange(desc(.estimate))
+auc_tab
+
+```
+**Comment:**
+
+This table presents the AUC (Area Under the Curve) values for the four models. The AUC is a single scalar value that summarizes the performance of the ROC curves you previously analyzed.
+
+The models have very similar values, which indicates that they have comparable discrimination performance.
+
+An AUC of about `r round(auc_tab$.estimate[auc_tab$Model == "Logit"], 2)` for the Logit model indicates a good classification ability: on average, it has about a `r round(100*auc_tab$.estimate[auc_tab$Model == "Logit"])`% chance of ranking a High Traffic recipe higher than a Low Traffic recipe (an AUC of 0.5 would be a random guess, and 1 a perfect model).
+
+```{r}
+# ===========================================
+#   Summary table of the test performance
+# ===========================================
+# All metrics are computed on the test set with the 0.5 threshold ("High" = positive class)
+
+perf_tab <- tibble(Model = c("PLM", "Logit", "LASSO", "Random Forest"),
+                   cm    = list(cm_plm, cm_logit, cm_lasso, cm_rf)) %>%
+  mutate(Accuracy    = map_dbl(cm, ~ unname((.x["TN"] + .x["TP"]) / sum(.x))),
+         Sensitivity = map_dbl(cm, ~ unname(.x["TP"] / (.x["TP"] + .x["FN"]))),   # share of High recipes correctly found
+         Specificity = map_dbl(cm, ~ unname(.x["TN"] / (.x["TN"] + .x["FP"]))),   # share of Low recipes correctly found
+         Precision   = map_dbl(cm, ~ unname(.x["TP"] / (.x["TP"] + .x["FP"])))) %>% # among recipes predicted High, share really High
+  dplyr::select(-cm) %>%
+  left_join(dplyr::select(auc_tab, Model, AUC = .estimate), by = "Model")
+
+kable(perf_tab, digits = 3)
+
+# Benchmark: accuracy of the naive model "always High" on the test set
+naive_acc <- mean(test$traffic_fact == "High")
+round(naive_acc, 3)
+
+get_perf <- function(model, metric, digits = 3) round(perf_tab[[metric]][perf_tab$Model == model], digits)
+```
+
+**Comment:**
+
+All the models do clearly better than the naive benchmark (accuracy of `r round(naive_acc, 3)` when always predicting "High"). Their accuracy, sensitivity, specificity, precision and AUC are very close to each other: the differences between models are small compared with the gain brought by any of them over the naive model.
+
+
+## 6.3. Model choosen : 
+
+The chosen model is : Logit Model
+
+
+## 6.4. reasons for choice : 
+
+For the AUC and ROC results, we observe that the performance is very similar across the three models. Considering the confusion matrices, the Logit and PLM models achieve a higher number of true negatives and lower number of false positives compared to the Random Forest model. Therefore, the choice is between the PLM and Logit models: since both have similar confusion matrices, we favored, on one hand, the simplicity and interpretability of the coefficients, and on the other hand, the fact that the dependent variable is categorical. The Logit model is particularly suitable because it ensures that predicted probabilities remain between 0 and 1 and allows interpretation of marginal effects. For these reasons, we selected the Logit model as our final model.
+
+On the test set, the Logit model reaches an accuracy of `r get_perf("Logit", "Accuracy")`, a sensitivity of `r get_perf("Logit", "Sensitivity")`, a specificity of `r get_perf("Logit", "Specificity")`, a precision of `r get_perf("Logit", "Precision")` and an AUC of `r get_perf("Logit", "AUC")`.
+
+The LASSO, which is a logit estimated with a penalty, reaches an AUC of `r get_perf("LASSO", "AUC")` (against `r get_perf("Logit", "AUC")` for the standard logit) while using fewer variables. Since the performances are very close, we keep the standard Logit as the final model: its coefficients are not shrunk, so its marginal effects can be interpreted directly, which is the aim of the study. The LASSO is used as a **confirmation of the variable selection** (section 4.5): the variables it removes are the same ones that have negligible marginal effects in the logit.
+
+*Remark:* since the comparison was made on the test set, the performance of the selected model is slightly optimistic; with such similar results between models, this does not change the choice.
+
+# 7.Interpretation of the  prefered model
+
+```{r, include=FALSE}
+# Helpers used to insert the numerical results directly in the text below
+ame_tab <- as.data.frame(me_ame$mfxest)
+find_row <- function(v, nm) grep(paste0("^", v, "\\*?$"), nm)
+
+# AME of a variable, in percentage points
+pp <- function(v) {
+  i <- find_row(v, rownames(ame_tab))
+  if (length(i) == 0) return(NA_real_)
+  round(100 * ame_tab[i[1], "dF/dx"], 2)
+}
+# t-score of the AME of a variable
+tsc <- function(v) {
+  i <- find_row(v, as.character(varimp_logit$variable))
+  if (length(i) == 0) return(NA_real_)
+  round(varimp_logit$t_score[i[1]], 1)
+}
+```
+
+This Logit model is based on a rigorous analysis of culinary and nutritional characteristics to predict the probability that a recipe will generate high traffic. The interpretation primarily relies on average marginal effects (AME), which measure the direct impact of each variable on a recipe’s success. The main finding lies in the predominance of dish categories, where recipes based on vegetables or potatoes increase the probability of success by `r pp("categoryVegetable")` and `r pp("categoryPotato")` percentage points, respectively, compared to beverages. This hierarchy is confirmed by variable importance, with these two categories displaying extremely high t-scores (`r tsc("categoryVegetable")` and `r tsc("categoryPotato")`), ensuring their statistical reliability. Other categories, such as pork, also play a crucial role, with a marginal effect of `r pp("categoryPork")` percentage points. In contrast, the model shows that nutritional indicators are far less decisive. For instance, sugar content has a negligible marginal effect of `r pp("sugar")` percentage points per additional gram of sugar per serving, while the sugar-to-calorie ratio (su_cal) has a more substantial effect of `r pp("su_cal")` percentage points per one-unit increase, suggesting that recipes that are too sweet relative to their caloric content reduce the probability of high traffic. (A one-unit increase of su_cal is very large, since most recipes have a ratio below 0.1: the effect should be read as a direction rather than as a realistic change.) Finally, variables such as protein or calories appear marginal, with effects close to zero, demonstrating that user engagement is more strongly linked to the culinary nature of the dish than to its precise nutritional details.
+
+
+
+
+
+
+## 7.1. Best (features) predectors 
+
+ The best predictors for the Logit model are the dish categories, specifically Vegetables, Potatoes, and Pork. These variables show the strongest positive association with high traffic levels. Conversely, nutritional variables like protein and calories are marginal predictors, while the sugar-to-calorie ratio (su_cal) acts as a negative predictor, slightly decreasing the probability of high traffic as the ratio increases.
+
+## 7.2. Is the model any good? 
+
+Yes, the Logit model performs well for predicting whether a recipe is High Traffic or Low Traffic. The model shows a good discriminative ability, with an AUC of about `r get_perf("Logit", "AUC", 2)`, indicating that it correctly ranks High Traffic recipes above Low Traffic ones about `r round(100*get_perf("Logit", "AUC", 2))`% of the time. Its accuracy (`r get_perf("Logit", "Accuracy", 2)`) is clearly above the naive benchmark of `r round(naive_acc, 2)` obtained by always predicting "High". The confusion matrix confirms this: it correctly classifies a high number of true positives and true negatives, with relatively few misclassification. Moreover, the model is highly interpretable -the category of the recipe is the strongest predictor, while nutritional variables and serving size have limited impact once category is considered. This interpretability helps understand how consumers might choose recipes, as the type of recipe strongly drives traffic. Overall, the combination of good predictive performance and clear interpretability makes the Logit model an appropriate and reliable choice for this task.
+
+The model is, however, not perfect: roughly one recipe out of `r round(1/(1 - get_perf("Logit", "Accuracy")))` is misclassified, so it should be used as a decision-support tool (to prioritise which recipes to feature), not as an exact forecast of traffic.
+
+## 7.3. What could be done, based on your insights from the model, to increase site traffic?
+
+Based on the insights from the Logit model, several strategies could be implemented to increase site traffic. First, recipe category is the most important predictor of traffic, which suggests that consumers have clear preferences. Recipes that are hearty, substantial, or family-style such as those including meat, pork, potatoes, or vegetables—tend to attract more visits, while lighter or individual meals like beverages or breakfasts are less popular. This indicates that users prefer satisfying, substantial meals, possibly for lunch or dinner, rather than quick or snack-type options.
+
+Therefore, the site could prioritize highlighting and promoting recipes in the high-traffic categories. Marketing campaigns, homepage features, or personalized recommendations could focus on these recipes to capture more user attention. Additionally, offering variations of popular recipes that align with cultural and taste preferences like traditional family meals or calorie-rich desserts—could further engage users. While nutritional content alone (like calories, protein, or sugar) has limited predictive power, recipes combining popular ingredients and flavors consistently attract more traffic. 
+
+Additionally, the site could:
+
+- Offer visitors recipes similar to those they have viewed or liked, to increase the time they spend on the site.
+- Provide a free preview of recipes, but reserve certain highly popular or exclusive recipes for subscribers
+- Ensure that recipe titles and descriptions contain relevant keywords to attract more visitors through search engines.
+
+Finally, the site could analyze seasonal or event-based trends to feature high-demand recipes at the right time, further increasing visits.
+
+## 7.4. Limitations and possible improvements
+
+- **Association, not causation**: the model shows which recipes are *associated* with high traffic. Promoting a category does not guarantee that traffic will increase; this could be tested with an A/B test on the home page.
+- **Definition of the target**: recipes with a missing traffic value were assumed to be "Low". If some of them are in fact unobserved, the Low class is partly mislabelled.
+- **Outliers and skewness**: the nutritional variables and the two ratios are very skewed. A log transformation or a robust treatment of extreme values could be tested.
+- **Single train/test split and fixed threshold**: results come from one random split and a 0.5 threshold. Repeated cross-validation would give a more stable estimate, and the threshold could be adjusted to favour sensitivity (not missing popular recipes) or precision (not promoting recipes that would not be popular), depending on the business objective.
+- **Regularisation**: the LASSO was used to select variables; an elastic net (`alpha` between 0 and 1) or a reduced logit re-estimated on the variables kept by the LASSO could also be tried.
+
+```{r}
+# Reproducibility: versions of R and of the packages used
+sessionInfo()
+```

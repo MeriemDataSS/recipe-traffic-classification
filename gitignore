@@ -1,0 +1,33 @@
+# ---- R session files ----
+.Rhistory
+.Rapp.history
+.RData
+.RDataTmp
+.Ruserdata
+.Rproj.user/
+
+# ---- R Markdown / knitr temporary files ----
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+.Rmd.lock
+
+# ---- Package management (if renv is used) ----
+renv/library/
+renv/local/
+renv/staging/
+
+# ---- Operating system files ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Editor files ----
+.vscode/
+.idea/
+*.swp
+
+# ---- Note ----
+# The rendered report (.html) and the dataset (.csv) are intentionally NOT ignored:
+# they are part of the deliverable.

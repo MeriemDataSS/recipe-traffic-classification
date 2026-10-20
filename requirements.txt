@@ -1,0 +1,25 @@
+# R packages required to knit Recipe_Trafic_binary_classification.Rmd
+# One package per line. Lines starting with # are comments.
+# Note: dplyr >= 1.1.0 is required (the code uses the .by argument).
+#
+# Install with:
+#   pkgs <- readLines("requirements.txt")
+#   pkgs <- pkgs[!grepl("^#|^\\s*$", pkgs)]
+#   install.packages(setdiff(pkgs, rownames(installed.packages())))
+
+tidyverse
+gridExtra
+corrplot
+caret
+glmnet
+ranger
+rsample
+mfx
+car
+sandwich
+lmtest
+yardstick
+stargazer
+knitr
+rmarkdown
+bslib

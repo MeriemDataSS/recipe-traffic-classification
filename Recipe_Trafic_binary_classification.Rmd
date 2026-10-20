@@ -31,7 +31,7 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
-
+knitr::opts_chunk$set(fig.path = "figures/", dev = "png", dpi = 150)
 # Packages used with the "::" syntax only (no library() call, to avoid masking dplyr functions):
 #   car, sandwich, lmtest, scales
 # If one of them is missing:  install.packages(c("car", "sandwich", "lmtest"))

@@ -945,6 +945,7 @@ ggplot(data=low_traffic_data,aes(x = fct_rev(fct_infreq(category)), fill = categ
   theme_minimal()
 ```
 
+
 **Comment:** 
 
 In contrast to the “High Traffic” class, where recipes based on potato, vegetables, and pork are predominant and beverages, breakfast, and chicken recipes are underrepresented, the “Low Traffic” class exhibits an opposite pattern. In this class, beverages, breakfast, and chicken categories are more prevalent, while recipes based on vegetables, potato, and pork are less represented.

@@ -59,10 +59,8 @@ The analysis follows seven steps, numbered as in the report.
    - Histograms, **density plots by traffic class**, boxplots on a log scale.
    ![Share of High-traffic recipes by category](figures/density-by-class-1.png)
    ![Share of High-traffic recipes by category](figures/unnamed-chunk-18-1.png)
-   <img src="figures/unnamed-chunk-21-1.png" alt="Share of High-traffic recipes by category" width="300">
+   ![Share of High-traffic recipes by category](figures/unnamed-chunk-21-1.png)
  ![Share of High-traffic recipes by category](figures/unnamed-chunk-24-1.png)
-
-
 
    - **Comparison of means** between classes (Welch t-test and Wilcoxon test with Holm correction), plus chi-squared tests for the discrete variables.
    - Correlation matrix.
